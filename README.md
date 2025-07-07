@@ -24,12 +24,24 @@ torchrun --standalone --nproc_per_node=$N_GPU train_gpt.py
 
 ## World Record History
 
-| Implementation     | Tokens    | Date       | Note                                                                    |
-|--------------------|-----------|------------|-------------------------------------------------------------------------|
-| llm.c (baseline)   | 10,486 M  | 05/28/2024 | Uses tied embeddings, only 124M parameters                              |
-| ~~modded-nanogpt~~ | ~~696 M~~ | 05/25/2025 | **Illegal**, uses value embeddings, increasing total parameters to 201M |
-| No Value Embedding | 747.11M   | 07/06/2025 | Remove value embeddings, train for 1900 steps                           |
-|                    |           |            |                                                                         |
+| Implementation          | Tokens    | Date       | Note                                                                |
+|-------------------------|-----------|------------|---------------------------------------------------------------------|
+| llm.c (baseline)        | 10,486 M  | 05/28/2024 | Uses tied embeddings, only 124M parameters                          |
+| ~~modded-nanogpt~~      | ~~696 M~~ | 05/25/2025 | Invalid, uses value embeddings, increasing total parameters to 201M |
+| No Value Embedding      | 747.11M   | 07/06/2025 | Remove value embeddings, train for 1900 steps                       |
+| Recurrent Intermediates | 668.47M   | 07/07/2025 | Repeat layers in forward pass                                       |
+
+### NOTES (remove)
+- **No Value Embedding**: left
+- **Repeat Layers**:
+  - step:1900/1900 val_loss:3.2808 train_time:3633534ms step_avg:1912.39ms tokens:747.11M
+  - `layer_seq = [0, 1, 2, 3] + [4, 5, 6, 7] * 4 + [8, 9, 10, 11]`
+    - step:1750/1900 val_loss:3.2830 train_time:5535960ms step_avg:3163.41ms tokens:688.13M``
+	- pstep:1900/1900 val_loss:3.2521 train_time:6038403ms step_avg:3178.11ms tokens:747.11M
+  - `layer_seq = [0, 1, 2] + [3, 4, 5, 6, 7, 8] * 4 + [9, 10, 11]`
+    - right
+  - `layer_seq = [0, 1, 2, 3, 4] + [5, 6] * 8 + [7, 8, 9, 10, 11]`
+  - `layer_seq = [0, 1, 2, 3, 4, 5] + [6, 7, 8] * 5 + [9, 10, 11]`
 
 ## Rules
 
@@ -41,7 +53,22 @@ torchrun --standalone --nproc_per_node=$N_GPU train_gpt.py
 ## Records
 
 ### No Value Embedding
-Remove value embeddings from modded-nanogpt in order to comply with 162M parameter limit.
+Remove value embeddings from modded-nanogpt in order to comply with 162M parameter limit. Requires longer training run of 1900 steps
+
+### Recurrent Intermediate Layers
+[logs](logs/83dda42f-c076-49b7-8933-457f56f0f4b0.txt)
+
+Rather than the forward pass looping through layers [0, 1, ..., 11], instead layers are looped. Specifically, the pattern is
+```
+0, 1, 2,
+3, 4, 5, 6, 7, 8,
+3, 4, 5, 6, 7, 8,
+3, 4, 5, 6, 7, 8,
+3, 4, 5, 6, 7, 8,
+9, 10, 11
+```
+
+`step:1700/1700 val_loss:3.2701 train_time:6555576ms step_avg:3856.22ms tokens:668.47M`
 
 ## Citations
 
