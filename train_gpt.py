@@ -1,13 +1,16 @@
 import os
 import sys
+import contextlib
+
 with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
+    code = f.read()  # noqa
+
 import uuid
 import time
 import copy
 import glob
 from dataclasses import dataclass
-from functools import lru_cache, partial # Added partial for hook registration
+from functools import lru_cache  # Added partial for hook registration
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -16,90 +19,9 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-
-# -----------------------------------------------------------------------------
-# Custom operators: FP8 matmul by @YouJiacheng
-
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
-def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
-    def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
-        out = torch._scaled_mm(
-            x_f8,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
-        return out, x_f8, w_f8
-
-    return impl(x, w)
-
-@mm_op.register_fake
-def _(x: Tensor, w: Tensor, *_):
-    assert x.ndim == w.ndim == 2
-    assert x.shape[1] == w.shape[1]
-    assert x.device == w.device
-    assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
-
-@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-        grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T.contiguous().T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
-            use_fast_accum=False,
-        )
-        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
-        grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
-            use_fast_accum=False,
-        ).T
-        return grad_x, grad_w
-
-    return impl(g, x_f8, w_f8)
-
-@mm_backward_op.register_fake
-def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
-
-def backward(ctx, grad_out: Tensor, *_):
-    x_f8, w_f8 = ctx.saved_tensors
-    x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
-        grad_out, x_f8, w_f8, x_s, w_s, grad_s
-    )
-    return grad_x, grad_w, None, None, None
-
-def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
-    *_, x_s, w_s, grad_s = inputs
-    _, x_f8, w_f8 = output
-    ctx.save_for_backward(x_f8, w_f8)
-    ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
-
-mm_op.register_autograd(backward, setup_context=setup_context)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -208,10 +130,10 @@ class Muon(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+    def __init__(self, in_features: int, out_features: int, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
@@ -223,12 +145,8 @@ class CastedLinear(nn.Linear):
             self.weight.uniform_(-bound, bound)
 
     def forward(self, x: Tensor):
-        if self.use_fp8 and self.training:
-            _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
-            return out.reshape(*x.shape[:-1], -1)
-        else:
-            return F.linear(x, self.weight.type_as(x))
+        return F.linear(x, self.weight.type_as(x))
+
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -249,6 +167,7 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
         super().__init__()
@@ -260,27 +179,38 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+    def forward(self, x: Tensor, v1: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
+        if v1 is None:
+            v1 = v  # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        y = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=block_mask,
+            scale=0.12,
+            kernel_options={
+                "BLOCK_M": 64, "BLOCK_N": 64,
+                "BLOCK_M1": 32, "BLOCK_N1": 64,
+                "BLOCK_M2": 64, "BLOCK_N2": 32,
+            }
+        ).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y
+        return y, v1
+
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -296,43 +226,46 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor, v1: Tensor, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask)
-        x = x + self.mlp(norm(x))
-        return x
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
+        x = x + x1
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x, v1
 
 # -----------------------------------------------------------------------------
 # The main model
 
+
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for _ in range(num_layers)])
+
+        self.layer_seq = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
-                                    use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+                                    x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
-        assert num_layers % 2 == 0
-        self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
+        assert len(self.layer_seq) % 2 == 0
+        self.skip_weights = nn.Parameter(torch.ones(len(self.layer_seq)//2))
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -377,24 +310,22 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
-
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
-        assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None])  # use of norm here by @Grad62304977
+        v1 = None
 
         # U-net design by @brendanh0gan
         skip_connections = []
         n = len(self.skip_weights)
-        for i in range(len(self.blocks)):
+        for i, layer_idx in enumerate(self.layer_seq):
+            block_mask = long_bm if i % 2 == 0 else short_bm
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, block_masks[i])
+
+            x, v1 = checkpoint(self.blocks[layer_idx], x, v1, x0, block_mask, use_reentrant=False)
+            # x, v1 = self.blocks[layer_idx](x, v1, x0, block_mask)
+
             if i < n:
                 skip_connections.append(x)
 
@@ -444,22 +375,26 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    # divide by 2 to fit on consumer hardware
+    train_seq_len = 48*1024 // 2
+    val_seq_len = 4*64*1024 // 2
+    # multiply by 2 to adjust for seq len
+    grad_accum_steps_per_device = (8 // int(os.environ["WORLD_SIZE"])) * 2
+
     # optimization
-    num_iterations = 1770 # number of iterations to run
+    num_iterations = 1700  # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 125  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
 args = Hyperparameters()
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+####assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -547,112 +482,6 @@ def get_window_size_blocks(step: int):
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
-#            Warmup kernels            #
-########################################
-
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del initial_state
-
-########################################
-#      Overlap Communication Setup     #
-########################################
-
-# Create parameter buckets for better overlap
-def create_buckets(params, bucket_size_mb=25):
-    """Group parameters into buckets of approximately bucket_size_mb MB each"""
-    buckets = []
-    current_bucket = []
-    current_size = 0
-
-    # Sort parameters by size (largest first) for better bucketing
-    sorted_params = sorted(params, key=lambda p: p.numel(), reverse=True)
-
-    for param in sorted_params:
-        param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
-
-        if current_size + param_size_mb > bucket_size_mb and current_bucket:
-            buckets.append(current_bucket)
-            current_bucket = [param]
-            current_size = param_size_mb
-        else:
-            current_bucket.append(param)
-            current_size += param_size_mb
-
-    if current_bucket:
-        buckets.append(current_bucket)
-
-    return buckets
-
-# Create buckets for all parameters
-all_params = [p for p in model.parameters() if p.requires_grad]
-param_buckets = create_buckets(all_params)
-
-print0(f"Created {len(param_buckets)} gradient buckets")
-for i, bucket in enumerate(param_buckets):
-    total_size = sum(p.numel() * p.element_size() for p in bucket) / (1024 * 1024)
-    print0(f"Bucket {i}: {len(bucket)} params, {total_size:.1f} MB")
-
-# Bucket state tracking
-bucket_ready_count = [0] * len(param_buckets)
-bucket_handles = [None] * len(param_buckets)
-param_to_bucket = {}
-
-# Map each parameter to its bucket index
-for bucket_idx, bucket in enumerate(param_buckets):
-    for param in bucket:
-        param_to_bucket[param] = bucket_idx
-
-def _gradient_hook(param: Tensor):
-    """Called when a parameter's gradient is ready"""
-    if param.grad is None:
-        return
-
-    bucket_idx = param_to_bucket[param]
-    bucket_ready_count[bucket_idx] += 1
-
-    # Check if all parameters in this bucket are ready
-    if bucket_ready_count[bucket_idx] == len(param_buckets[bucket_idx]):
-        # All-reduce this bucket
-        bucket_grads = [p.grad for p in param_buckets[bucket_idx]]
-
-        # For multi-tensor operations, we can reduce them together
-        if len(bucket_grads) == 1:
-            handle = dist.all_reduce(bucket_grads[0], op=dist.ReduceOp.AVG, async_op=True)
-        else:
-            # Use multi-tensor all-reduce for efficiency
-            handle = dist.all_reduce_coalesced(bucket_grads, op=dist.ReduceOp.AVG, async_op=True)
-
-        bucket_handles[bucket_idx] = handle
-
-# Register hooks for all parameters
-print0("Registering bucketed gradient hooks...")
-for param in all_params:
-    param.register_post_accumulate_grad_hook(_gradient_hook)
-
-def wait_for_gradients():
-    """Wait for all gradient reductions to complete and reset bucket state"""
-    for handle in bucket_handles:
-        if handle is not None:
-            handle.wait()
-
-    # Reset state for next iteration
-    for i in range(len(bucket_ready_count)):
-        bucket_ready_count[i] = 0
-        bucket_handles[i] = None
-
-########################################
 #        Training and validation       #
 ########################################
 
@@ -684,7 +513,8 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        num_toks = step * args.grad_accum_steps_per_device * args.train_seq_len * world_size
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms tokens:{num_toks / 1e6:.2f}M", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -700,10 +530,12 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
-    #for param in model.parameters():
-    #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    wait_for_gradients() # does the same thing as commented two lines above, but faster
+    for i in range(1, args.grad_accum_steps_per_device + 1):
+        loss = model(inputs, targets, get_window_size_blocks(step))
+        inputs, targets = next(train_loader)
+        loss.backward()
+    for name, p in model.named_parameters():
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
 
     # set optimization hyperparameters
     for opt in optimizers:
