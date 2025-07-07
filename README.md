@@ -36,7 +36,7 @@ torchrun --standalone --nproc_per_node=$N_GPU train_gpt.py
 * **Parameter limit**: ≤ 162M parameters (including embeddings). Inactive parameters count towards the total.
 * **Target**: achieve ≤ 3.28 cross-entropy loss on FineWeb val.
 * **Data**: Must use FineWeb dataset. Sample order are fixed. Samples cannot be repeated. Sample size per batch may vary.
-- **Time**: Must train on 8xH100 in fewer than 30 minutes
+* **Time**: Must train on 8xH100 in fewer than 30 minutes
 
 ## Records
 
