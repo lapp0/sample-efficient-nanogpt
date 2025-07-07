@@ -1,7 +1,7 @@
 # Sample-Efficient NanoGPT
 
 ## Overview
-Sample-Efficient NanoGPT is a fork of [modded-nanogpt][1], inspired by its NanoGPT speedrun. The goal is to train a language model that achieves ≤ 3.28 cross-entropy loss on the FineWeb validation set. No specific hardware requirements.
+Sample-Efficient NanoGPT is a fork of [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt). The goal is to train a language model that achieves ≤ 3.28 cross-entropy loss on the FineWeb validation set. No specific hardware requirements.
 
 **Why sample efficiency?**
 Maximizing learning per token uncovers new architectures and training methods that current hardware and kernels don’t yet optimize. These insights steer future hardware and kernel design to leverage these advancements.
@@ -45,10 +45,10 @@ torchrun --standalone --nproc_per_node=$N_GPU train_gpt.py
 
 ## Rules
 
-* **Parameter limit**: ≤ 162M parameters (including embeddings). Active/inactive does not matter.
+* **Parameter limit**: ≤ 162M parameters (including embeddings). Inactive parameters count towards the total.
 * **Target**: achieve ≤ 3.28 cross-entropy loss on FineWeb val.
 * **Data**: Must use FineWeb dataset. Sample order are fixed. Samples cannot be repeated. Sample size per batch may vary.
-- **Time**: Must train on 8xH100 in fewer than 30 minutes
+* **Time**: Must train on 8xH100 in fewer than 30 minutes
 
 ## Records
 
