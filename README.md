@@ -31,18 +31,6 @@ torchrun --standalone --nproc_per_node=$N_GPU train_gpt.py
 | No Value Embedding      | 747.11M   | 07/06/2025 | Remove value embeddings, train for 1900 steps                       |
 | Recurrent Intermediates | 668.47M   | 07/07/2025 | Repeat layers in forward pass                                       |
 
-### NOTES (remove)
-- **No Value Embedding**: left
-- **Repeat Layers**:
-  - step:1900/1900 val_loss:3.2808 train_time:3633534ms step_avg:1912.39ms tokens:747.11M
-  - `layer_seq = [0, 1, 2, 3] + [4, 5, 6, 7] * 4 + [8, 9, 10, 11]`
-    - step:1750/1900 val_loss:3.2830 train_time:5535960ms step_avg:3163.41ms tokens:688.13M``
-	- pstep:1900/1900 val_loss:3.2521 train_time:6038403ms step_avg:3178.11ms tokens:747.11M
-  - `layer_seq = [0, 1, 2] + [3, 4, 5, 6, 7, 8] * 4 + [9, 10, 11]`
-    - right
-  - `layer_seq = [0, 1, 2, 3, 4] + [5, 6] * 8 + [7, 8, 9, 10, 11]`
-  - `layer_seq = [0, 1, 2, 3, 4, 5] + [6, 7, 8] * 5 + [9, 10, 11]`
-
 ## Rules
 
 * **Parameter limit**: ≤ 162M parameters (including embeddings). Inactive parameters count towards the total.
