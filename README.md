@@ -36,6 +36,8 @@ torchrun --standalone --nproc_per_node=$N_GPU train_gpt.py
 * **Parameter limit**: ≤ 162M parameters (including embeddings). Inactive parameters count towards the total.
 * **Target**: achieve ≤ 3.28 cross-entropy loss on FineWeb val.
 * **Data**: Must accept FineWeb tokens in the order the dataloader provides. Process the tokens as you like.
+  * **Tokenization**: You may train a new tokenizer, but only on data equal to or less than the number of tokens used to train your model. Sequence order must remain unchanged. For alternative tokenizers, evaluation will be based on [Bits-Per-Byte (BPB)](https://arxiv.org/pdf/2412.09871).
+
 * **Time**: Must train on 8xH100 in fewer than 30 minutes
 
 ## Records
